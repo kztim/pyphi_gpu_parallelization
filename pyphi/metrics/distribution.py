@@ -502,43 +502,38 @@ def batched_sinkhorn(hamming_size: int):
 #4096: 0.049s
 #8192: 0.090s
 
-#
-#@measures.register("sinkhorn")
-#def sinkhorn(p: ArrayLike, q: ArrayLike, **kwargs) -> float:
-#    print(f"Available devices: {jax.devices()}")
-#    print(f"Default backend: {jax.default_backend()}")
-#
-#    p = np.asarray(p)
-#    q = np.asarray(q)
-#
-#    p_flat = flatten(p)
-#    q_flat = flatten(q)
-#
-#    N = p.squeeze().ndim
-#
-#    if N != 1:
-#        import math
-#        N = int(math.log2(len(p.flatten())))
-#
-#    hamming = _hamming_matrix(N)
-#
-#    if getattr(config, 'SINKHORN_GPU_BATCHING', False):
-#        p_jax_flat = jnp.atleast_2d(jnp.asarray(p_flat))
-#        q_jax_flat = jnp.atleast_2d(jnp.asarray(q_flat))
-#        hamming_jax = jnp.asarray(hamming)
-#
-#        result = batched_sinkhorn(p_jax_flat, q_jax_flat, hamming_jax)
-#        print(jnp.squeeze(result))
-#        return float(jnp.squeeze(result))
-#
-#
-#    geo = geometry.Geometry(cost_matrix=hamming)
-#    problem = linear_problem.LinearProblem(geo, a=p_flat, b=q_flat)
-#    solver = ott_sinkhorn.Sinkhorn()
-#    solve = solver(problem)
-#
-#    print(f'{float(solve.reg_ot_cost)=}')
-#    return float(solve.reg_ot_cost)
+@measures.register("sinkhorn")
+def sinkhorn(p: ArrayLike, q: ArrayLike, **kwargs) -> float:
+    p = np.asarray(p)
+    q = np.asarray(q)
+
+    p_flat = flatten(p)
+    q_flat = flatten(q)
+
+    N = p.squeeze().ndim
+
+    if N != 1:
+        import math
+        N = int(math.log2(len(p.flatten())))
+
+    hamming = _hamming_matrix(N)
+
+    if getattr(config, 'SINKHORN_GPU_BATCHING', False):
+        p_jax_flat = jnp.atleast_2d(jnp.asarray(p_flat))
+        q_jax_flat = jnp.atleast_2d(jnp.asarray(q_flat))
+        hamming_jax = jnp.asarray(hamming)
+
+        result = batched_sinkhorn(p_jax_flat, q_jax_flat, hamming_jax)
+
+        return float(jnp.squeeze(result))
+
+
+    geo = geometry.Geometry(cost_matrix=hamming)
+    problem = linear_problem.LinearProblem(geo, a=p_flat, b=q_flat)
+    solver = ott_sinkhorn.Sinkhorn()
+    solve = solver(problem)
+
+    return float(solve.reg_ot_cost)
 
 @measures.register("EMD")
 def emd(p: ArrayLike, q: ArrayLike, direction: Direction | None = None) -> float:
