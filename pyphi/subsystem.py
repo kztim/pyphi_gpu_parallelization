@@ -30,6 +30,8 @@ from .direction import Direction
 from .distribution import max_entropy_distribution
 from .distribution import repertoire_shape
 from .metrics.distribution import repertoire_distance as _repertoire_distance
+from .metrics.distribution import _hamming_matrix
+from .metrics.distribution import batched_sinkhorn
 from .models import CauseEffectStructure
 from .models import Concept
 from .models import MaximallyIrreducibleCause
@@ -51,6 +53,11 @@ from .types import Purview
 from .types import Repertoire
 from .types import State
 from .utils import state_of
+
+import jax.numpy as jnp
+import math
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 if TYPE_CHECKING:
     from .cache import DictCache
@@ -857,6 +864,7 @@ class Subsystem:
                 **kwargs,
             )
             selectivity = None
+            #print(f'{repertoire=} {partitioned_repertoire=}')
         return RepertoireIrreducibilityAnalysis(
             phi=phi,
             direction=direction,
@@ -873,6 +881,9 @@ class Subsystem:
             selectivity=selectivity,
         )
 
+
+
+    
     def _find_mip_single_state(
         self,
         specified_state,
@@ -901,33 +912,96 @@ class Subsystem:
                 state=specified_state,
                 **kwargs,
             )
+        
+        partitions_list = list(partitions)
 
-        candidate_mips = MapReduce(
-            _evaluate_partition,
-            partitions,
-            shortcircuit_func=utils.is_falsy,
-            desc="Evaluating mechanism partitions",
-            **parallel_kwargs,
-        ).run()
-        # Type narrowing: MapReduce returns Iterable[RepertoireIrreducibilityAnalysis]
-        assert candidate_mips is not None, "MapReduce.run() should not return None"
+        print(len(partitions_list))
+        
+        batch_size = 8192
+        if config.SINKHORN_GPU_BATCHING and config.REPERTOIRE_DISTANCE == 'sinkhorn' and len(partitions_list) > 0:
+            import time
+            start_time = time.time()
+            partitioned = []
 
-        ties = tuple(
-            resolve_ties.partitions(
-                candidate_mips,  # type: ignore[arg-type]  # MapReduce generic type not fully inferred
-                default=_null_ria(
-                    direction,
-                    mechanism,
-                    purview,
-                    phi=0,
-                    specified_state=specified_state,
-                ),
+            for p in partitions_list:
+                partitioned.append(self.partitioned_repertoire(direction, p).flatten())
+
+            p_flat = jnp.atleast_2d(jnp.array(repertoire.flatten()))
+            q_batch = jnp.array(partitioned)
+            p_batch = jnp.broadcast_to(p_flat, q_batch.shape)
+
+            if q_batch.size < batch_size:
+                q_padded = jnp.pad(q_batch, ((0, batch_size - q_batch.shape[0]), (0, 0)))
+            else:
+                q_padded = q_batch
+            p_padded = jnp.broadcast_to(p_flat, q_padded.shape)
+
+            print(f'{len(p_padded)=} {len(q_padded)=}')
+
+            N = int(math.log2(len(repertoire.flatten())))
+
+            batcher = batched_sinkhorn(N)
+
+            print(f'CPU time: {time.time() - start_time}')
+
+            start_time = time.time()
+            results = []
+            if len(partitions_list) > batch_size:
+                for i in range(0, len(partitions_list), batch_size):
+
+                    p = p_batch[i:(i+batch_size)]
+                    q = q_batch[i:(i+batch_size)]
+
+                    print(f'{i=} {len(p)=} {len(q)=}')
+                    if len(p) < batch_size or len(q) < batch_size:
+                        q_padded = jnp.pad(q, ((0, batch_size - q.shape[0]), (0, 0)))
+                        p_padded = jnp.pad(p, ((0, batch_size - p.shape[0]), (0, 0)))
+
+
+                        print(f'{i=} {len(p_padded)=} {len(q_padded)=}')
+                        result = batcher(p_padded, q_padded).block_until_ready()
+                        results.append(result)
+                        break
+
+                    result = batcher(p, q).block_until_ready()
+                    results.append(result.flatten())
+            else:
+                results.append(batcher(p_padded, q_padded).block_until_ready())
+
+            print(f'GPU time: {time.time() - start_time}')
+            results = jnp.concatenate([jnp.atleast_1d(r) for r in results])
+            results = results[:q_batch.shape[0]]
+            
+            min_index = jnp.argmin(results)
+            return _null_ria(direction, mechanism, purview, repertoire, float(results[min_index]))
+        else:
+            candidate_mips = MapReduce(
+                _evaluate_partition,
+                partitions,
+                shortcircuit_func=utils.is_falsy,
+                desc="Evaluating mechanism partitions",
+                **parallel_kwargs,
+            ).run()
+            # Type narrowing: MapReduce returns Iterable[RepertoireIrreducibilityAnalysis]
+            assert candidate_mips is not None, "MapReduce.run() should not return None"
+
+            ties = tuple(
+                resolve_ties.partitions(
+                    candidate_mips,  # type: ignore[arg-type]  # MapReduce generic type not fully inferred
+                    default=_null_ria(
+                        direction,
+                        mechanism,
+                        purview,
+                        phi=0,
+                        specified_state=specified_state,
+                    ),
+                )
             )
-        )
-        for tie in ties:
-            # TODO(ties) do this assignment in resolve_ties
-            tie.set_partition_ties(ties)
-        return ties[0]
+            for tie in ties:
+                # TODO(ties) do this assignment in resolve_ties
+                tie.set_partition_ties(ties)
+
+            return ties[0]
 
     def find_mip(
         self,
