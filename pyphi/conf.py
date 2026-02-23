@@ -960,6 +960,24 @@ class PyphiConfig(Config):
     condition is found.""",
     )
 
+    SINKHORN_GPU_BATCHING = Option(
+        False,
+        type=bool,
+        doc="""
+    Controls whether GPU batching is used during sinkhorn approx. 
+    """,
+    )
+
+    SINKHORN_GPU_BATCH_SIZE = Option(
+        8192,
+        type=int,
+        doc="""
+    Number of repertoire pairs to be sent to GPU during sinkhorn approx. 
+    """
+    )
+
+
+
     def log(self):
         """Log current settings."""
         log.info("PyPhi v%s", version("pyphi"))

@@ -51,6 +51,7 @@ class PyphiConfig(Config):
     MAXIMUM_CACHE_MEMORY_PERCENTAGE: int
     PRECISION: int
     REPR_VERBOSITY: Literal[0, 1, 2]
+    SINKHORN_GPU_BATCH_SIZE: int
 
     # String configuration
     REPERTOIRE_DISTANCE: str
@@ -89,6 +90,7 @@ class PyphiConfig(Config):
     PRINT_FRACTIONS: bool
     SYSTEM_PARTITION_INCLUDE_COMPLETE: bool
     SHORTCIRCUIT_SIA: bool
+    SINKHORN_GPU_BATCHING = bool
 
     # Mapping/Dict configuration
     PARALLEL_COMPLEX_EVALUATION: Mapping[str, Any]
