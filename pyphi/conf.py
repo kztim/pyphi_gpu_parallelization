@@ -960,11 +960,11 @@ class PyphiConfig(Config):
     condition is found.""",
     )
 
-    SINKHORN_GPU_BATCHING = Option(
-        False,
-        type=bool,
+    SINKHORN_GPU_BATCHING_LEVEL = Option(
+        "MECHANISM",
+        values=["PARTITION", "MECHANISM"],
         doc="""
-    Controls whether GPU batching is used during sinkhorn approx. 
+    Controls what level sinkhorn GPU batching occurs at. 
     """,
     )
 

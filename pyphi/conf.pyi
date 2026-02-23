@@ -73,6 +73,7 @@ class PyphiConfig(Config):
     STATE_TIE_RESOLUTION: str
     PURVIEW_TIE_RESOLUTION: str
     SYSTEM_CUTS: Literal["3.0_STYLE", "CONCEPT_STYLE"]
+    SINKHORN_GPU_BATCHING_LEVEL: Literal["PARTITION", "MECHANISM"]
 
     # Boolean configuration
     ASSUME_CUTS_CANNOT_CREATE_NEW_CONCEPTS: bool
@@ -90,7 +91,6 @@ class PyphiConfig(Config):
     PRINT_FRACTIONS: bool
     SYSTEM_PARTITION_INCLUDE_COMPLETE: bool
     SHORTCIRCUIT_SIA: bool
-    SINKHORN_GPU_BATCHING = bool
 
     # Mapping/Dict configuration
     PARALLEL_COMPLEX_EVALUATION: Mapping[str, Any]

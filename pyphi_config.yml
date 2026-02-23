@@ -42,7 +42,7 @@ PURVIEW_TIE_RESOLUTION: PHI
 # Controls the number of worker processes used in parallel evaluation.
 # Negative numbers count backwards from the total number of available CPUs,
 # with ``-1`` meaning all available CPUs.
-PARALLEL_WORKERS: -1
+PARALLEL_WORKERS: 1
 # Backend for parallel computation. Options: "local" (ProcessPoolExecutor),
 # "auto" (auto-detect best available).
 PARALLEL_BACKEND: "local"
@@ -67,7 +67,7 @@ PARALLEL_CUT_EVALUATION:
   chunksize: 4096
   parallel: false
   sequential_threshold: 1024
-  progress: false
+  progress: true
 # Controls parallel evaluation of candidate purviews.
 PARALLEL_PURVIEW_EVALUATION:
   chunksize: 256
@@ -110,7 +110,8 @@ REDIS_CONFIG:
 # analyzing a system.
 RELATION_COMPUTATION: CONCRETE
 # The measure to use when computing integration ("EMD", "KLD", "L1", ...)
-REPERTOIRE_DISTANCE: GENERALIZED_INTRINSIC_DIFFERENCE
+#REPERTOIRE_DISTANCE: GENERALIZED_INTRINSIC_DIFFERENCE
+REPERTOIRE_DISTANCE: 'sinkhorn'
 # The measure to use when computing intrinsic information and finding the
 # specified state
 REPERTOIRE_DISTANCE_SPECIFICATION: GENERALIZED_INTRINSIC_DIFFERENCE
@@ -131,11 +132,15 @@ SYSTEM_CUTS: 3.0_STYLE
 # applies to "SET_UNI/BI".
 SYSTEM_PARTITION_INCLUDE_COMPLETE: false
 # Controls the partitioning scheme for the system.
-SYSTEM_PARTITION_TYPE: SET_UNI/BI
+SYSTEM_PARTITION_TYPE: DIRECTED_BI
 # Controls whether a system is validated for conditional independence.
 VALIDATE_CONDITIONAL_INDEPENDENCE: true
 # Controls whether a subsystem's state is validated when the subsystem is
 # created.
-VALIDATE_SUBSYSTEM_STATES: true
+VALIDATE_SUBSYSTEM_STATES: False
 # Whether to suppress the welcome message.
-WELCOME_OFF: false
+WELCOME_OFF: True
+# Whether to use GPU parallelization for sinkhorn approx.
+SINKHORN_GPU_BATCHING_LEVEL: MECHANISM
+# Max GPU batching size. 
+SINKHORN_GPU_BATCH_SIZE: 8192
