@@ -59,6 +59,8 @@ import math
 import os
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
+from collections import defaultdict
+
 if TYPE_CHECKING:
     from .cache import DictCache
     from .labels import NodeLabels
@@ -917,8 +919,8 @@ class Subsystem:
 
         print(len(partitions_list))
         
-        batch_size = 8192
-        if config.SINKHORN_GPU_BATCHING and config.REPERTOIRE_DISTANCE == 'sinkhorn' and len(partitions_list) > 1000:
+        batch_size = config.SINKHORN_GPU_BATCH_SIZE
+        if config.SINKHORN_GPU_BATCHING_LEVEL == 'PARTITION' and config.REPERTOIRE_DISTANCE == 'sinkhorn' and len(partitions_list) > 1000:
             import time
             start_time = time.time()
             partitioned = []
@@ -974,34 +976,32 @@ class Subsystem:
             
             min_index = jnp.argmin(results)
             return _null_ria(direction, mechanism, purview, repertoire, float(results[min_index]))
-        else:
-            candidate_mips = MapReduce(
-                _evaluate_partition,
-                partitions,
-                shortcircuit_func=utils.is_falsy,
-                desc="Evaluating mechanism partitions",
-                **parallel_kwargs,
-            ).run()
-            # Type narrowing: MapReduce returns Iterable[RepertoireIrreducibilityAnalysis]
-            assert candidate_mips is not None, "MapReduce.run() should not return None"
-
-            ties = tuple(
-                resolve_ties.partitions(
-                    candidate_mips,  # type: ignore[arg-type]  # MapReduce generic type not fully inferred
-                    default=_null_ria(
-                        direction,
-                        mechanism,
-                        purview,
-                        phi=0,
-                        specified_state=specified_state,
-                    ),
-                )
+        
+        candidate_mips = MapReduce(
+            _evaluate_partition,
+            partitions,
+            shortcircuit_func=utils.is_falsy,
+            desc="Evaluating mechanism partitions",
+            **parallel_kwargs,
+        ).run()
+        # Type narrowing: MapReduce returns Iterable[RepertoireIrreducibilityAnalysis]
+        assert candidate_mips is not None, "MapReduce.run() should not return None"
+        ties = tuple(
+            resolve_ties.partitions(
+                candidate_mips,  # type: ignore[arg-type]  # MapReduce generic type not fully inferred
+                default=_null_ria(
+                    direction,
+                    mechanism,
+                    purview,
+                    phi=0,
+                    specified_state=specified_state,
+                ),
             )
-            for tie in ties:
-                # TODO(ties) do this assignment in resolve_ties
-                tie.set_partition_ties(ties)
-
-            return ties[0]
+        )
+        for tie in ties:
+            # TODO(ties) do this assignment in resolve_ties
+            tie.set_partition_ties(ties)
+        return ties[0]
 
     def find_mip(
         self,
@@ -1326,6 +1326,60 @@ class Subsystem:
         parallel_kwargs = conf.parallel_kwargs(
             dict(config.PARALLEL_PURVIEW_EVALUATION), **kwargs
         )
+
+        if config.REPERTOIRE_DISTANCE == 'sinkhorn' and config.SINKHORN_GPU_BATCHING_LEVEL == 'MECHANISM':
+            
+            class PurviewIter:
+                def __init__(self, purview):
+                    self.purview = purview
+                    self.start_iter = 0
+                    self.end_iter = 0
+
+            combined_purviews = []
+            combined_q = []
+            combined_p = []
+            for purv in purviews_list:
+                partitions = list(mip_partitions(mechanism, purv, self.node_labels))
+                repertoire = self.repertoire(direction, mechanism, purv)
+                
+                purview_iter = PurviewIter(purv)
+                purview_iter.start_iter = len(combined_q)
+
+                for part in partitions:
+                    combined_q.append(self.partitioned_repertoire(direction, part).flatten())
+                    combined_p.append(repertoire.flatten())
+
+                purview_iter.end_iter = len(combined_q)
+                combined_purviews.append(purview_iter)
+
+            groups = defaultdict(list)
+
+            for i, (p, q) in enumerate(zip(combined_p, combined_q)):
+                groups[len(q)].append((i, p, q))
+
+            total = len(combined_p)
+            processed = 0
+            results = []
+            for size, items in sorted(groups.items(), reverse=True):
+                for item in items:
+                    item_size = len(item)
+                    
+                    for i in range(0, item_size, config.SINKHORN_GPU_BATCH_SIZE):
+                        chunk = items[i:i + config.SINKHORN_GPU_BATCH_SIZE]
+                        indices, p_group, q_group = zip(*chunk)
+                        
+                        print(f'BATCHING {processed} / {total}')
+                        processed += 1
+
+                        p_group = jnp.array(p_group)
+                        q_group = jnp.array(q_group)
+                        N = int(math.log2(size))
+
+                        batcher = batched_sinkhorn(N)
+                        results.append(batcher(p_group, q_group).block_until_ready())
+                        
+            print('DONE')
+
         map_reduce = MapReduce(
             _find_mip,
             purviews_list,
