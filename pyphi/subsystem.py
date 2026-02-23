@@ -918,7 +918,7 @@ class Subsystem:
         print(len(partitions_list))
         
         batch_size = 8192
-        if config.SINKHORN_GPU_BATCHING and config.REPERTOIRE_DISTANCE == 'sinkhorn' and len(partitions_list) > 0:
+        if config.SINKHORN_GPU_BATCHING and config.REPERTOIRE_DISTANCE == 'sinkhorn' and len(partitions_list) > 1000:
             import time
             start_time = time.time()
             partitioned = []
@@ -930,7 +930,7 @@ class Subsystem:
             q_batch = jnp.array(partitioned)
             p_batch = jnp.broadcast_to(p_flat, q_batch.shape)
 
-            if q_batch.size < batch_size:
+            if len(partitions_list) < batch_size:
                 q_padded = jnp.pad(q_batch, ((0, batch_size - q_batch.shape[0]), (0, 0)))
             else:
                 q_padded = q_batch
