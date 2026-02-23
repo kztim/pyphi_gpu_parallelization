@@ -13,6 +13,12 @@ from scipy.spatial.distance import cdist
 from scipy.special import entr
 from scipy.special import rel_entr
 
+import os
+import logging
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+logging.getLogger("jax").setLevel(logging.ERROR)
+
 from pyphi import utils
 from pyphi import validate
 from pyphi.cache import joblib_memory
@@ -28,7 +34,6 @@ from pyphi.types import Repertoire
 from pyphi.types import State
 
 _LN_OF_2 = np.log(2)
-
 
 class DistanceResult(PyPhiFloat):
     """A numeric result that can carry auxiliary data about its computation.
@@ -373,7 +378,7 @@ _hamming_matrices = utils.load_data(
 
 # TODO extend to nonbinary nodes
 def _hamming_matrix(N: int) -> np.ndarray:
-    """Return a matrix of Hamming distances for the possible states of |N|
+    """Return a matrix ofcfor the possible states of |N|
     binary nodes.
 
     Args:
@@ -461,6 +466,79 @@ def effect_emd(p: ArrayLike, q: ArrayLike) -> float:
         sum(abs(marginal_zero(p, i) - marginal_zero(q, i)) for i in range(p.ndim))
     )
 
+import jax
+import jax.numpy as jnp
+from functools import lru_cache, partial
+import ott
+from ott.geometry import geometry
+from ott.problems.linear import linear_problem
+from ott.solvers.linear import sinkhorn as ott_sinkhorn
+
+
+@lru_cache(maxsize=None)
+def batched_sinkhorn(hamming_size: int):
+
+    hamming_matrix = jnp.array(_hamming_matrix(hamming_size))
+    geo = geometry.Geometry(cost_matrix=hamming_matrix)
+    solver = ott_sinkhorn.Sinkhorn(lse_mode=True, max_iterations=10, threshold=1e-3)
+
+    @jax.jit
+    @partial(jax.vmap, in_axes=(0, 0))
+    def batch(p_flat: jnp.ndarray, q_flat: jnp.ndarray):
+        
+        problem = linear_problem.LinearProblem(geo, a=p_flat, b=q_flat)
+        solve = solver(problem)
+
+        return solve.reg_ot_cost
+    
+    return batch
+
+#64: 0.003s
+#128: 0.003s
+#256: 0.005s
+#512: 0.005s
+#1024: 0.009s
+#2048: 0.026s
+#4096: 0.049s
+#8192: 0.090s
+
+#
+#@measures.register("sinkhorn")
+#def sinkhorn(p: ArrayLike, q: ArrayLike, **kwargs) -> float:
+#    print(f"Available devices: {jax.devices()}")
+#    print(f"Default backend: {jax.default_backend()}")
+#
+#    p = np.asarray(p)
+#    q = np.asarray(q)
+#
+#    p_flat = flatten(p)
+#    q_flat = flatten(q)
+#
+#    N = p.squeeze().ndim
+#
+#    if N != 1:
+#        import math
+#        N = int(math.log2(len(p.flatten())))
+#
+#    hamming = _hamming_matrix(N)
+#
+#    if getattr(config, 'SINKHORN_GPU_BATCHING', False):
+#        p_jax_flat = jnp.atleast_2d(jnp.asarray(p_flat))
+#        q_jax_flat = jnp.atleast_2d(jnp.asarray(q_flat))
+#        hamming_jax = jnp.asarray(hamming)
+#
+#        result = batched_sinkhorn(p_jax_flat, q_jax_flat, hamming_jax)
+#        print(jnp.squeeze(result))
+#        return float(jnp.squeeze(result))
+#
+#
+#    geo = geometry.Geometry(cost_matrix=hamming)
+#    problem = linear_problem.LinearProblem(geo, a=p_flat, b=q_flat)
+#    solver = ott_sinkhorn.Sinkhorn()
+#    solve = solver(problem)
+#
+#    print(f'{float(solve.reg_ot_cost)=}')
+#    return float(solve.reg_ot_cost)
 
 @measures.register("EMD")
 def emd(p: ArrayLike, q: ArrayLike, direction: Direction | None = None) -> float:
