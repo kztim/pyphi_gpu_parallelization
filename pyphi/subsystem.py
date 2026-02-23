@@ -1334,6 +1334,11 @@ class Subsystem:
                     self.purview = purview
                     self.start_iter = 0
                     self.end_iter = 0
+                    self.min_distance = 0
+                    self.min_index = 0
+                    self.partitions = None
+                    self.repertoire = None
+                    self.partitioned_repertoire = None
 
             combined_purviews = []
             combined_q = []
@@ -1350,6 +1355,9 @@ class Subsystem:
                     combined_p.append(repertoire.flatten())
 
                 purview_iter.end_iter = len(combined_q)
+                purview_iter.partitions = partitions
+                purview_iter.repertoire = repertoire
+
                 combined_purviews.append(purview_iter)
 
             groups = defaultdict(list)
@@ -1359,26 +1367,47 @@ class Subsystem:
 
             total = len(combined_p)
             processed = 0
-            results = []
+            results = [None] * total
             for size, items in sorted(groups.items(), reverse=True):
-                for item in items:
-                    item_size = len(item)
                     
-                    for i in range(0, item_size, config.SINKHORN_GPU_BATCH_SIZE):
-                        chunk = items[i:i + config.SINKHORN_GPU_BATCH_SIZE]
-                        indices, p_group, q_group = zip(*chunk)
-                        
-                        print(f'BATCHING {processed} / {total}')
-                        processed += 1
+                for i in range(0, len(items), config.SINKHORN_GPU_BATCH_SIZE):
+                    chunk = items[i:i + config.SINKHORN_GPU_BATCH_SIZE]
+                    indices, p_group, q_group = zip(*chunk)
+                    
+                    processed += len(chunk)
+                    print(f'BATCHING {processed} / {total} comparisons')
+                    
+                    p_group = jnp.array(p_group)
+                    q_group = jnp.array(q_group)
+                    N = int(math.log2(size))
+                    batcher = batched_sinkhorn(N)
+                    batch_results = batcher(p_group, q_group).block_until_ready().flatten()
 
-                        p_group = jnp.array(p_group)
-                        q_group = jnp.array(q_group)
-                        N = int(math.log2(size))
+                    for index, result in zip(indices, batch_results):
+                        results[index] = float(result)
 
-                        batcher = batched_sinkhorn(N)
-                        results.append(batcher(p_group, q_group).block_until_ready())
-                        
-            print('DONE')
+            purview_mice_candidate = combined_purviews[0]
+            for purview_iter in combined_purviews:
+                results_split = results[purview_iter.start_iter:purview_iter.end_iter]
+                min_distance = min(results_split)
+                min_index = results_split.index(min_distance)
+                purview_iter.min_distance = min_distance
+
+                if min_distance >= purview_mice_candidate.min_distance:
+                    purview_mice_candidate = purview_iter
+                    purview_iter.min_index = min_index
+                    purview_iter.mip = purview_iter.partitions[min_index]
+                    purview_iter.partitioned_repertoire = self.partitioned_repertoire(direction, purview_iter.mip)
+
+            del combined_p, combined_q, groups, combined_purviews
+
+            ria = self.evaluate_partition(direction, mechanism, purview_mice_candidate.purview, 
+                                            purview_mice_candidate.mip, purview_mice_candidate.repertoire,
+                                            purview_mice_candidate.partitioned_repertoire)
+
+            
+
+            return mice_class(ria)
 
         map_reduce = MapReduce(
             _find_mip,
