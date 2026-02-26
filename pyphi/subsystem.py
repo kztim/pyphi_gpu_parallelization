@@ -60,6 +60,8 @@ import os
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 
 from collections import defaultdict
 
@@ -1331,9 +1333,6 @@ class Subsystem:
         )
 
         if config.REPERTOIRE_DISTANCE == 'sinkhorn' and config.SINKHORN_GPU_BATCHING_LEVEL == 'MECHANISM':
-            
-            start_time = time.time()
-
             class PurviewIter:
                 def __init__(self, purview):
                     self.purview = purview
@@ -1350,7 +1349,6 @@ class Subsystem:
             combined_p = []
             purview_meta = []
             for purv in purviews_list:
-                
                 partitions = list(mip_partitions(mechanism, purv, self.node_labels))
                 repertoire = self.repertoire(direction, mechanism, purv)
                 purview_meta.append((purv, partitions, repertoire))
@@ -1394,57 +1392,68 @@ class Subsystem:
             for i, (p, q) in enumerate(zip(combined_p, combined_q)):
                 groups[len(q)].append((i, p, q))
 
-            print(f'Preprocessing: {time.time() - start_time}')
-
             total = len(combined_p)
-            processed = 0
             results = [None] * total
-            for size, items in sorted(groups.items(), reverse=True):
-                persistent_chunk = []
-                persistent_chunk.extend(items)
+            batch_queue = queue.Queue(maxsize=50)
+            def cpu_producer(): 
+                for size, items in sorted(groups.items(), reverse=True):
+                    persistent_chunk = list(items)
 
-                while len(persistent_chunk) >= config.SINKHORN_GPU_BATCH_SIZE:
+                    while len(persistent_chunk) >= config.SINKHORN_GPU_BATCH_SIZE:
+                        chunk = persistent_chunk[:config.SINKHORN_GPU_BATCH_SIZE]
+                        persistent_chunk = persistent_chunk[config.SINKHORN_GPU_BATCH_SIZE:]
 
-                    chunk = persistent_chunk[:config.SINKHORN_GPU_BATCH_SIZE]
-                    persistent_chunk = persistent_chunk[config.SINKHORN_GPU_BATCH_SIZE:]
+                        indices, p_group, q_group = zip(*chunk)
 
-                    indices, p_group, q_group = zip(*chunk)
+                        p_group = jnp.array(p_group)
+                        q_group = jnp.array(q_group)
 
-                    processed += len(chunk)
-                    print(f'Batching {processed} / {total} pairs (Size: {size}) {len(p_group)=} {len(q_group)=}')
+                        N = int(math.log2(p_group.shape[1]))
 
-                    p_group = jnp.array(p_group)
-                    q_group = jnp.array(q_group)
-                    N = int(math.log2(size))
-                    
-                    start_time = time.time()
-                    batcher = batched_sinkhorn(N)
-                    chunk_results = batcher(p_group, q_group)
-                    print(f'GPU Time: {time.time() - start_time}')
+                        batch_queue.put((indices, p_group, q_group, N, len(chunk)))
 
-                    for index, result in zip(indices, chunk_results):
-                        results[index] = float(result)
+                    if persistent_chunk:
+                        indices, p_group, q_group = zip(*persistent_chunk)
 
-                if persistent_chunk:
-                    indices, p_group, q_group = zip(*persistent_chunk)
+                        p_group = jnp.array(p_group)
+                        q_group = jnp.array(q_group)
 
-                    p_group = jnp.array(p_group)
-                    q_group = jnp.array(q_group)
-                    
-                    actual_size = p_group.shape[0]
-                    pad = config.SINKHORN_GPU_BATCH_SIZE - actual_size
+                        actual_size = len(persistent_chunk)
 
-                    p_group = jnp.pad(p_group, ((0, pad), (0, 0)))
-                    q_group = jnp.pad(q_group, ((0, pad), (0, 0)))
+                        p_group = jnp.pad(jnp.array(p_group), ((0, config.SINKHORN_GPU_BATCH_SIZE - actual_size), (0, 0)))
+                        q_group = jnp.pad(jnp.array(q_group), ((0, config.SINKHORN_GPU_BATCH_SIZE - actual_size), (0, 0)))
 
-                    batcher = batched_sinkhorn(int(math.log2(size)))
-                    chunk_results = batcher(p_group, q_group).block_until_ready().flatten()
+                        N = int(math.log2(p_group.shape[1]))
 
-                    for index, result in zip(indices, chunk_results[:actual_size]):
-                        results[index] = float(result)
+                        batch_queue.put((indices, p_group, q_group, N, actual_size))
 
-                    print('LEFTOVERS')
+                batch_queue.put(None)
+
+            producer = threading.Thread(target=cpu_producer, daemon=True)
+            producer.start()
+
+            processed = 0
+            while True:
+                batch = batch_queue.get()
+
+                if batch is None:
+                    break
                 
+                start_time = time.time()
+                indices, p_group, q_group, N, size = batch
+
+                batcher = batched_sinkhorn(N)
+
+                chunk_results = batcher(p_group, q_group).block_until_ready().flatten()
+
+                for index, result in zip(indices, chunk_results[:size]):
+                    results[index] = float(result)
+
+                processed += len(chunk_results)
+                
+                print(f'GPU time: {time.time() - start_time} Processed: {processed} / {len(results)}')
+            producer.join()
+
             start_time = time.time()
 
             purview_mice_candidate = combined_purviews[0]
