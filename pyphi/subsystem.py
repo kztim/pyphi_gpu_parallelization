@@ -55,6 +55,7 @@ from .types import State
 from .utils import state_of
 
 import jax.numpy as jnp
+import jax
 import math
 import os
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -1333,150 +1334,195 @@ class Subsystem:
         )
 
         if config.REPERTOIRE_DISTANCE == 'sinkhorn' and config.SINKHORN_GPU_BATCHING_LEVEL == 'MECHANISM':
+            from collections import defaultdict, deque
+
+            pre_process = time.time()
+
             class PurviewIter:
                 def __init__(self, purview):
                     self.purview = purview
                     self.start_iter = 0
                     self.end_iter = 0
-                    self.min_distance = 0
-                    self.min_index = 0
+                    self.min_distance = float('inf')
+                    self.min_index = -1
                     self.partitions = None
                     self.repertoire = None
                     self.partitioned_repertoire = None
 
-            combined_purviews = []
-            combined_q = []
-            combined_p = []
-            purview_meta = []
-            for purv in purviews_list:
-                partitions = list(mip_partitions(mechanism, purv, self.node_labels))
-                repertoire = self.repertoire(direction, mechanism, purv)
-                purview_meta.append((purv, partitions, repertoire))
-                
+            # ----------------------------
+            # 1) Build global task list
+            # ----------------------------
 
             tasks = []
             purview_iters = []
             offset = 0
-            for purv, partitions, repertoire in purview_meta:
+
+            for purv in purviews_list:
+                partitions = list(mip_partitions(mechanism, purv, self.node_labels))
+                repertoire = self.repertoire(direction, mechanism, purv)
+                flat_repertoire = np.asarray(repertoire, dtype=np.float32).flatten()
+
                 purview_iter = PurviewIter(purv)
                 purview_iter.start_iter = offset
                 purview_iter.end_iter = offset + len(partitions)
                 purview_iter.partitions = partitions
                 purview_iter.repertoire = repertoire
-
                 purview_iters.append(purview_iter)
 
-                flat_repertoire = repertoire.flatten()
                 for i, part in enumerate(partitions):
-                    tasks.append((offset + i, part, flat_repertoire))
+                    tasks.append((offset + i, flat_repertoire, part))
+
                 offset += len(partitions)
 
-            combined_p = [None] * offset
-            combined_q = [None] * offset
+            total = len(tasks)
+            results = [None] * total
+            combined_q = [None] * total
 
-            def compute(task):
-                index, partition, flat_repertoire = task
-                return index, flat_repertoire, self.partitioned_repertoire(direction, partition).flatten()
+            # --------------------------------
+            # 2) Compute all partitioned reps
+            # --------------------------------
+
+            def compute_q(task):
+                index, p_flat, partition = task
+                q = np.asarray(
+                self.partitioned_repertoire(direction, partition),
+                dtype=np.float32
+                )
+
+                p_len = len(p_flat)
+                q_flat = q.flatten()
+
+                if len(q_flat) != p_len:
+                    expand_factor = p_len // len(q_flat)
+                    q_flat = np.repeat(q_flat, expand_factor)
+                    q_flat /= expand_factor
+
+                return index, p_flat, q_flat
 
             with ThreadPoolExecutor(max_workers=16) as executor:
-                futures = [executor.submit(compute, t) for t in tasks]
-
+                futures = [executor.submit(compute_q, t) for t in tasks]
                 for future in as_completed(futures):
-                    index, p_flat, q_flat = future.result()
-                    combined_p[index] = p_flat
-                    combined_q[index] = q_flat
+                    idx, p, q = future.result()
+                    tasks[idx] = (idx, p, q)
+                    combined_q[idx] = q
 
-            combined_purviews = purview_iters
+            # --------------------------------
+            # 3) Strict shape grouping (by N)
+            # --------------------------------
 
             groups = defaultdict(list)
-            for i, (p, q) in enumerate(zip(combined_p, combined_q)):
-                groups[len(q)].append((i, p, q))
+            for idx, p, q in tasks:
+                assert len(p) == len(q), f"Shape mismatch: p={len(p)}, q={len(q)}"
+                N = int(math.log2(len(q)))
+                groups[N].append((idx, p, q))
 
-            total = len(combined_p)
-            results = [None] * total
-            batch_queue = queue.Queue(maxsize=50)
-            def cpu_producer(): 
-                for size, items in sorted(groups.items(), reverse=True):
-                    persistent_chunk = list(items)
+            del tasks  # free RAM early
 
-                    while len(persistent_chunk) >= config.SINKHORN_GPU_BATCH_SIZE:
-                        chunk = persistent_chunk[:config.SINKHORN_GPU_BATCH_SIZE]
-                        persistent_chunk = persistent_chunk[config.SINKHORN_GPU_BATCH_SIZE:]
+            # --------------------------------
+            # 4) Cached JIT kernels per N
+            # --------------------------------
 
-                        indices, p_group, q_group = zip(*chunk)
+            batcher_cache = {}
 
-                        p_group = jnp.array(p_group)
-                        q_group = jnp.array(q_group)
+            def get_batcher(N):
+                if N not in batcher_cache:
+                    batcher_cache[N] = batched_sinkhorn(N)
+                return batcher_cache[N]
 
-                        N = int(math.log2(p_group.shape[1]))
-
-                        batch_queue.put((indices, p_group, q_group, N, len(chunk)))
-
-                    if persistent_chunk:
-                        indices, p_group, q_group = zip(*persistent_chunk)
-
-                        p_group = jnp.array(p_group)
-                        q_group = jnp.array(q_group)
-
-                        actual_size = len(persistent_chunk)
-
-                        p_group = jnp.pad(jnp.array(p_group), ((0, config.SINKHORN_GPU_BATCH_SIZE - actual_size), (0, 0)))
-                        q_group = jnp.pad(jnp.array(q_group), ((0, config.SINKHORN_GPU_BATCH_SIZE - actual_size), (0, 0)))
-
-                        N = int(math.log2(p_group.shape[1]))
-
-                        batch_queue.put((indices, p_group, q_group, N, actual_size))
-
-                batch_queue.put(None)
-
-            producer = threading.Thread(target=cpu_producer, daemon=True)
-            producer.start()
+            # --------------------------------
+            # 5) GPU execution loop
+            # --------------------------------
 
             processed = 0
-            while True:
-                batch = batch_queue.get()
 
-                if batch is None:
-                    break
-                
-                start_time = time.time()
-                indices, p_group, q_group, N, size = batch
+            for N in sorted(groups.keys(), reverse=True):
+                items = groups[N]
+                batch_size = config.SINKHORN_GPU_BATCH_SIZE
+                batcher = get_batcher(N)
 
-                batcher = batched_sinkhorn(N)
+                for i in range(0, len(items), batch_size):
+                    chunk = items[i:i + batch_size]
+                    indices, p_group, q_group = zip(*chunk)
 
-                chunk_results = batcher(p_group, q_group).block_until_ready().flatten()
+                    p_group = jax.device_put(
+                        np.stack(p_group),
+                        jax.devices('gpu')[0]
+                    )
+                    q_group = jax.device_put(
+                        np.stack(q_group),
+                        jax.devices('gpu')[0]
+                    )
 
-                for index, result in zip(indices, chunk_results[:size]):
-                    results[index] = float(result)
+                    pre_process = time.time() - pre_process
 
-                processed += len(chunk_results)
-                
-                print(f'GPU time: {time.time() - start_time} Processed: {processed} / {len(results)}')
-            producer.join()
+                    t0 = time.time()
+                    out = batcher(p_group, q_group).block_until_ready()
+                    gpu_time = time.time() - t0
 
-            start_time = time.time()
+                    for idx, val in zip(indices, out):
+                        results[idx] = float(val)
 
-            purview_mice_candidate = combined_purviews[0]
-            for purview_iter in combined_purviews:
+                    processed += len(chunk)
+                    ot_sec = int(processed / max(1e-6, gpu_time))
+
+                    print(
+                        f"total pre-processing: {pre_process}"
+                        f"GPU time: {gpu_time:.4f}  "
+                        f"Processed: {processed} / {total}  "
+                        f"OT solves/S: {ot_sec}"
+                    )
+
+            # --------------------------------
+            # 6) Extract winning purview
+            # --------------------------------
+
+            purview_mice_candidate = purview_iters[0]
+
+            for purview_iter in purview_iters:
                 results_split = results[purview_iter.start_iter:purview_iter.end_iter]
                 min_distance = min(results_split)
                 min_index = results_split.index(min_distance)
+
                 purview_iter.min_distance = min_distance
+                purview_iter.min_index = min_index
 
                 if min_distance >= purview_mice_candidate.min_distance:
                     purview_mice_candidate = purview_iter
-                    purview_iter.min_index = min_index
-                    purview_iter.mip = purview_iter.partitions[min_index]
-                    purview_iter.partitioned_repertoire = self.partitioned_repertoire(direction, purview_iter.mip)
 
-            del combined_p, combined_q, groups, combined_purviews
+            global_min_index = (
+                purview_mice_candidate.start_iter +
+                purview_mice_candidate.min_index
+            )
 
-            ria = self.evaluate_partition(direction, mechanism, purview_mice_candidate.purview, 
-                                            purview_mice_candidate.mip, purview_mice_candidate.repertoire,
-                                            purview_mice_candidate.partitioned_repertoire)
+            purview_mice_candidate.mip = (
+                purview_mice_candidate.partitions[
+                    purview_mice_candidate.min_index
+                ]
+            )
 
-            print(f'Post time: {time.time() - start_time}')
+            partitioned_rep = combined_q[global_min_index].reshape(
+                purview_mice_candidate.repertoire.shape
+            )
 
+            ria = RepertoireIrreducibilityAnalysis(
+                phi=purview_mice_candidate.min_distance,
+                direction=direction,
+                mechanism=mechanism,
+                purview=purview_mice_candidate.purview,
+                partition=purview_mice_candidate.mip,
+                repertoire=purview_mice_candidate.repertoire,
+                partitioned_repertoire=partitioned_rep,
+                mechanism_state=state_of(mechanism, self.state),
+                purview_state=state_of(
+                    purview_mice_candidate.purview,
+                    self.state
+                ),
+                specified_state=None,
+                node_labels=self.node_labels,
+                selectivity=None,
+            )
+
+            del groups, combined_q, results, purview_iters
             return mice_class(ria)
 
         map_reduce = MapReduce(
