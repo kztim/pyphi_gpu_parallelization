@@ -474,13 +474,12 @@ from ott.geometry import geometry
 from ott.problems.linear import linear_problem
 from ott.solvers.linear import sinkhorn as ott_sinkhorn
 
-
-@lru_cache(maxsize=None)
+@lru_cache
 def batched_sinkhorn(hamming_size: int):
 
     hamming_matrix = jnp.array(_hamming_matrix(hamming_size))
     geo = geometry.Geometry(cost_matrix=hamming_matrix)
-    solver = ott_sinkhorn.Sinkhorn(lse_mode=True, max_iterations=10, threshold=1e-3)
+    solver = ott_sinkhorn.Sinkhorn(lse_mode=True, max_iterations=1, threshold=1e-3)
 
     @jax.jit
     @partial(jax.vmap, in_axes=(0, 0))
